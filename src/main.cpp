@@ -23,6 +23,7 @@ const char* password = "12345678";
 MPU6050 mpu;
 WebServer server(80);
 float pitch = 0, roll = 0, yaw = 0;
+float pitch_input = 0, roll_input = 0;
 float throttle = 0;
 int motor1_speed = 0, motor2_speed = 0, motor3_speed = 0;
 bool armed = false;
@@ -39,7 +40,7 @@ struct SystemDiagnostics {
   unsigned long last_check = 0;
 } diag;
 
-// Professional Flight Control Dashboard HTML
+// Professional Flight Control Dashboard HTML with Joystick
 const char* html_page = R"(
 <!DOCTYPE html>
 <html>
@@ -159,43 +160,79 @@ const char* html_page = R"(
             text-align: center;
         }
         
+        .gimbal-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        
         .gimbal-input {
-            width: 200px;
-            height: 200px;
-            margin: 0 auto 20px;
+            width: 250px;
+            height: 250px;
             background: radial-gradient(circle at 30% 30%, rgba(0,255,0,0.1), transparent);
-            border: 2px solid #00ff00;
+            border: 3px solid #00ff00;
             border-radius: 50%;
             position: relative;
             display: flex;
             align-items: center;
             justify-content: center;
+            cursor: crosshair;
+            touch-action: none;
         }
         
         .gimbal-center {
-            width: 80px;
-            height: 80px;
+            width: 100px;
+            height: 100px;
             background: rgba(0, 255, 0, 0.2);
-            border: 2px solid #00ff00;
+            border: 3px solid #00ff00;
             border-radius: 5px;
             display: flex;
             align-items: center;
             justify-content: center;
             color: #00ff00;
-            font-size: 20px;
+            font-size: 24px;
+            position: relative;
+            z-index: 10;
+        }
+        
+        .gimbal-cursor {
+            width: 20px;
+            height: 20px;
+            background: #00ff00;
+            border: 2px solid #00ff00;
+            border-radius: 50%;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            box-shadow: 0 0 10px #00ff00;
+            z-index: 20;
         }
         
         .gimbal-label {
             position: absolute;
-            font-size: 10px;
+            font-size: 9px;
             color: #00aaaa;
             text-transform: uppercase;
+            font-weight: bold;
         }
         
-        .gimbal-label.top { top: 10px; }
-        .gimbal-label.bottom { bottom: 10px; }
-        .gimbal-label.left { left: 10px; }
-        .gimbal-label.right { right: 10px; }
+        .gimbal-label.top { top: 8px; left: 50%; transform: translateX(-50%); }
+        .gimbal-label.bottom { bottom: 8px; left: 50%; transform: translateX(-50%); }
+        .gimbal-label.left { left: 8px; top: 50%; transform: translateY(-50%); }
+        .gimbal-label.right { right: 8px; top: 50%; transform: translateY(-50%); }
+        
+        .gimbal-values {
+            position: absolute;
+            bottom: -40px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 12px;
+            color: #00ff00;
+            white-space: nowrap;
+            width: 200px;
+            text-align: center;
+        }
         
         .spatial-grid {
             display: grid;
@@ -400,8 +437,8 @@ const char* html_page = R"(
         
         @media (max-width: 768px) {
             .main-grid { grid-template-columns: 1fr; }
-            .gimbal-input { width: 150px; height: 150px; }
-            .gimbal-center { width: 60px; height: 60px; }
+            .gimbal-input { width: 180px; height: 180px; }
+            .gimbal-center { width: 70px; height: 70px; }
         }
     </style>
 </head>
@@ -439,13 +476,17 @@ const char* html_page = R"(
         <div class="controls-row">
             <div class="control-panel">
                 <div class="control-title">ATTITUDE CONTROL</div>
-                <div class="control-title" style="font-size: 10px; color: #00aaaa; margin-top: -10px;">GIMBAL INPUT</div>
-                <div class="gimbal-input">
-                    <div class="gimbal-label top">PITCH FORWARD</div>
-                    <div class="gimbal-label bottom">PITCH BACKWARD</div>
-                    <div class="gimbal-label left">ROLL LEFT</div>
-                    <div class="gimbal-label right">ROLL RIGHT</div>
-                    <div class="gimbal-center">✚</div>
+                <div class="control-title" style="font-size: 10px; color: #00aaaa; margin-top: -10px;">GIMBAL INPUT - MOVE YOUR MOUSE/FINGER</div>
+                <div class="gimbal-container">
+                    <div class="gimbal-input" id="gimbalInput">
+                        <div class="gimbal-label top">▲ PITCH FWD</div>
+                        <div class="gimbal-label bottom">▼ PITCH BCK</div>
+                        <div class="gimbal-label left">◄ ROLL LEFT</div>
+                        <div class="gimbal-label right">► ROLL RIGHT</div>
+                        <div class="gimbal-cursor" id="gimbalCursor"></div>
+                        <div class="gimbal-center">✚</div>
+                        <div class="gimbal-values" id="gimbalValues">PITCH: 0° | ROLL: 0°</div>
+                    </div>
                 </div>
             </div>
             
@@ -496,6 +537,81 @@ const char* html_page = R"(
     </div>
     
     <script>
+        const gimbalInput = document.getElementById('gimbalInput');
+        const gimbalCursor = document.getElementById('gimbalCursor');
+        const gimbalValues = document.getElementById('gimbalValues');
+        
+        let gimbalActive = false;
+        let pitchControl = 0;
+        let rollControl = 0;
+        
+        // Gimbal Input Handler
+        gimbalInput.addEventListener('mousedown', () => { gimbalActive = true; });
+        gimbalInput.addEventListener('mouseup', () => { gimbalActive = false; });
+        gimbalInput.addEventListener('mousemove', handleGimbalInput);
+        gimbalInput.addEventListener('mouseleave', () => { gimbalActive = false; resetGimbal(); });
+        
+        // Touch Support
+        gimbalInput.addEventListener('touchstart', () => { gimbalActive = true; });
+        gimbalInput.addEventListener('touchend', () => { gimbalActive = false; resetGimbal(); });
+        gimbalInput.addEventListener('touchmove', handleGimbalInput);
+        
+        function handleGimbalInput(e) {
+            if (!gimbalActive && e.type !== 'touchmove') return;
+            
+            const rect = gimbalInput.getBoundingClientRect();
+            let x, y;
+            
+            if (e.touches) {
+                x = e.touches[0].clientX - rect.left;
+                y = e.touches[0].clientY - rect.top;
+            } else {
+                x = e.clientX - rect.left;
+                y = e.clientY - rect.top;
+            }
+            
+            const centerX = rect.width / 2;
+            const centerY = rect.height / 2;
+            const radius = Math.min(rect.width, rect.height) / 2 - 20;
+            
+            let offsetX = x - centerX;
+            let offsetY = y - centerY;
+            
+            const distance = Math.sqrt(offsetX * offsetX + offsetY * offsetY);
+            
+            if (distance > radius) {
+                const angle = Math.atan2(offsetY, offsetX);
+                offsetX = Math.cos(angle) * radius;
+                offsetY = Math.sin(angle) * radius;
+            }
+            
+            gimbalCursor.style.left = (centerX + offsetX) + 'px';
+            gimbalCursor.style.top = (centerY + offsetY) + 'px';
+            
+            rollControl = (offsetX / radius) * 100;
+            pitchControl = -(offsetY / radius) * 100;
+            
+            gimbalValues.textContent = `PITCH: ${pitchControl.toFixed(0)}° | ROLL: ${rollControl.toFixed(0)}°`;
+            
+            sendGimbalInput();
+        }
+        
+        function resetGimbal() {
+            gimbalCursor.style.left = '50%';
+            gimbalCursor.style.top = '50%';
+            rollControl = 0;
+            pitchControl = 0;
+            gimbalValues.textContent = `PITCH: 0° | ROLL: 0°`;
+        }
+        
+        function sendGimbalInput() {
+            fetch('/api/gimbal', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({pitch: pitchControl, roll: rollControl})
+            });
+        }
+        
         function updateTelemetry() {
             fetch('/api/telemetry')
                 .then(r => r.json())
@@ -537,7 +653,10 @@ const char* html_page = R"(
         }
         
         function emergencyStop() {
-            fetch('/api/disarm', {method: 'POST'}).then(() => updateTelemetry());
+            fetch('/api/disarm', {method: 'POST'}).then(() => {
+                updateTelemetry();
+                resetGimbal();
+            });
         }
         
         function updateThrottle() {
@@ -645,6 +764,22 @@ void setupWebServer() {
     server.send(200, "application/json", response);
   });
   
+  server.on("/api/gimbal", HTTP_POST, []() {
+    if (server.hasArg("plain")) {
+      DynamicJsonDocument doc(256);
+      deserializeJson(doc, server.arg("plain"));
+      pitch_input = doc["pitch"];
+      roll_input = doc["roll"];
+      
+      pitch = pitch + (pitch_input * 0.1);
+      roll = roll + (roll_input * 0.1);
+      
+      pitch = constrain(pitch, -45, 45);
+      roll = constrain(roll, -45, 45);
+    }
+    server.send(200, "application/json", "{\"status\":\"ok\"}");
+  });
+  
   server.on("/api/arm", HTTP_POST, []() {
     if (!diag.imu_ok) {
       diag.error_details = "Cannot arm: IMU not connected";
@@ -663,6 +798,8 @@ void setupWebServer() {
     motor1_speed = 0;
     motor2_speed = 0;
     motor3_speed = 0;
+    pitch_input = 0;
+    roll_input = 0;
     diag.error_details = "";
     server.send(200, "application/json", "{\"status\":\"disarmed\"}");
     Serial.println("[System] ✓ DRONE DISARMED");
@@ -733,8 +870,9 @@ void setup() {
   delay(2000);
   
   Serial.println("\n\n========================================");
-  Serial.println("  MINI DRONE FLIGHT CONTROLLER v2.0");
+  Serial.println("  MINI DRONE FLIGHT CONTROLLER v3.0");
   Serial.println("  Professional Flight Control Interface");
+  Serial.println("  WITH JOYSTICK TRACKING");
   Serial.println("========================================\n");
   
   setupMotors();
@@ -745,6 +883,7 @@ void setup() {
   Serial.println("\n[System] ✓ All systems initialized");
   Serial.println("[System] ✓ Connect to WiFi: MiniDrone / 12345678");
   Serial.println("[System] ✓ Open browser: http://192.168.4.1");
+  Serial.println("[System] ✓ MOVE YOUR MOUSE ON GIMBAL TO CONTROL PITCH/ROLL");
   Serial.println("========================================\n");
 }
 
